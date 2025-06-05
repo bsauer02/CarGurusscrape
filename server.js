@@ -19,7 +19,9 @@ app.post('/scrape', async (req, res) => {
     yearRange, 
     maxPrice, 
     maxMileage,
-    zipCode = '63105' // Default to St. Louis
+    zipCode = '63105', // Default to St. Louis
+    distance = 500, // Default to 500 miles, can be number or 'nationwide'
+    skipDetails = false // New option to skip detail page scraping for speed
   } = req.body;
 
   try {
@@ -42,15 +44,56 @@ app.post('/scrape', async (req, res) => {
     // Set user agent to avoid detection
     await page.setUserAgent('Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36');
 
-    // Build CarGurus search URL
-    let searchUrl = `https://www.cargurus.com/Cars/inventorylisting/viewDetailsFilterViewInventoryListing.action?zip=${zipCode}`;
+    // Build search URL - Use general search if make/model provided
+    let searchUrl;
     
-    // Add search parameters
-    if (maxPrice) searchUrl += `&maxPrice=${maxPrice}`;
-    if (maxMileage) searchUrl += `&maxMileage=${maxMileage}`;
-    searchUrl += '&showNegotiable=true&sortDir=ASC&sourceContext=carGurusHomePageModel&distance=500&sortType=PRICE';
+    if (make || model) {
+      // Use CarGurus search with query parameter for make/model
+      const searchQuery = [make, model].filter(Boolean).join(' ');
+      searchUrl = `https://www.cargurus.com/Cars/searchresults.action?zip=${zipCode}&searchDistance=${distance === 'nationwide' ? 3000 : distance}&query=${encodeURIComponent(searchQuery)}`;
+      
+      // Add filters
+      if (maxPrice) searchUrl += `&maxPrice=${maxPrice}`;
+      if (maxMileage) searchUrl += `&maxMileage=${maxMileage}`;
+      
+      // Handle year range
+      if (yearRange) {
+        const years = yearRange.split('-');
+        if (years.length === 2) {
+          searchUrl += `&minYear=${years[0]}&maxYear=${years[1]}`;
+        } else if (years.length === 1) {
+          searchUrl += `&minYear=${years[0]}&maxYear=${years[0]}`;
+        }
+      }
+    } else {
+      // Use inventory listing for browsing without specific make/model
+      searchUrl = `https://www.cargurus.com/Cars/inventorylisting/viewDetailsFilterViewInventoryListing.action?zip=${zipCode}`;
+      
+      if (maxPrice) searchUrl += `&maxPrice=${maxPrice}`;
+      if (maxMileage) searchUrl += `&maxMileage=${maxMileage}`;
+      
+      // Handle year range
+      if (yearRange) {
+        const years = yearRange.split('-');
+        if (years.length === 2) {
+          searchUrl += `&minYear=${years[0]}&maxYear=${years[1]}`;
+        } else if (years.length === 1) {
+          searchUrl += `&minYear=${years[0]}&maxYear=${years[0]}`;
+        }
+      }
+      
+      // Handle distance
+      if (distance === 'nationwide') {
+        searchUrl += '&distance=3000';
+      } else {
+        searchUrl += `&distance=${distance}`;
+      }
+      
+      searchUrl += '&showNegotiable=true&sortDir=ASC&sourceContext=carGurusHomePageModel&sortType=PRICE';
+    }
 
     console.log('Navigating to:', searchUrl);
+    console.log(`Search: ${make || 'Any'} ${model || ''} | Distance: ${distance === 'nationwide' ? 'Nationwide' : distance + ' miles'}`);
     
     await page.goto(searchUrl, { 
       waitUntil: 'networkidle2',
@@ -69,7 +112,9 @@ app.post('/scrape', async (req, res) => {
         '.car-listing',
         '[data-testid="listing-tile"]',
         '.listing-item',
-        'article[role="article"]'
+        'article[role="article"]',
+        '.result-list-item',
+        '.cg-listingCard'
       ];
       
       let listingElements = [];
@@ -77,12 +122,17 @@ app.post('/scrape', async (req, res) => {
         const elements = document.querySelectorAll(selector);
         if (elements.length > 0) {
           listingElements = elements;
+          console.log(`Found listings with selector: ${selector}`);
           break;
         }
       }
 
+      if (listingElements.length === 0) {
+        console.log('No listings found with any selector');
+      }
+
       listingElements.forEach((elem, index) => {
-        if (index >= 10) return; // Limit to first 10 results
+        if (index >= 20) return; // Get more results
         
         try {
           // Extract text content helper
@@ -94,21 +144,37 @@ app.post('/scrape', async (req, res) => {
             return '';
           };
 
-          // Get the detail page link
-          const linkElement = elem.querySelector('a');
-          const detailUrl = linkElement ? linkElement.href : '';
+          // Get the detail page link - try multiple selectors
+          let detailUrl = '';
+          const linkSelectors = ['a[href*="/Cars/"]', 'a.cg-listingCard-link', 'a'];
+          for (const selector of linkSelectors) {
+            const linkElement = elem.querySelector(selector);
+            if (linkElement && linkElement.href) {
+              detailUrl = linkElement.href;
+              break;
+            }
+          }
 
           const listing = {
-            title: getText(['h4', '.listing-title', '[data-testid="listing-title"]']),
-            price: getText(['.price', '[data-testid="price"]', '.cg-dealFinder-priceAndMoPayment']),
-            mileage: getText(['.mileage', '[data-testid="mileage"]']),
-            location: getText(['.dealer-location', '.location', '[data-testid="location"]']),
+            title: getText(['h4', '.listing-title', '[data-testid="listing-title"]', '.cg-listingCard-title']),
+            price: getText(['.price', '[data-testid="price"]', '.cg-dealFinder-priceAndMoPayment', '.cg-listingCard-price']),
+            mileage: getText(['.mileage', '[data-testid="mileage"]', '.cg-listingCard-specs']),
+            location: getText(['.dealer-location', '.location', '[data-testid="location"]', '.cg-listingCard-dealerName']),
             detailUrl: detailUrl,
             vin: elem.getAttribute('data-vin') || '',
-            yearMakeModel: getText(['.make-model', '[data-testid="year-make-model"]'])
+            yearMakeModel: getText(['.make-model', '[data-testid="year-make-model"]', '.cg-listingCard-title'])
           };
 
-          if (listing.title || listing.price) {
+          // Extract any visible car details
+          const allText = elem.textContent;
+          if (!listing.title && allText) {
+            // Try to extract from full text
+            const lines = allText.split('\n').map(l => l.trim()).filter(l => l);
+            if (lines.length > 0) listing.title = lines[0];
+            if (lines.length > 1 && lines[1].includes('$')) listing.price = lines[1];
+          }
+
+          if (listing.title || listing.price || listing.detailUrl) {
             results.push(listing);
           }
         } catch (err) {
@@ -119,10 +185,52 @@ app.post('/scrape', async (req, res) => {
       return results;
     });
 
+    console.log(`Found ${listings.length} listings`);
+
+    // If no listings found, check if we're on a "no results" page
+    if (listings.length === 0) {
+      const pageContent = await page.evaluate(() => {
+        return {
+          hasNoResults: document.body.textContent.includes('No exact matches') || 
+                       document.body.textContent.includes('0 results') ||
+                       document.body.textContent.includes('no listings'),
+          suggestion: document.querySelector('.search-suggestion')?.textContent || ''
+        };
+      });
+
+      if (pageContent.hasNoResults) {
+        await browser.close();
+        return res.json({
+          success: true,
+          count: 0,
+          message: `No exact matches found for ${make} ${model}. CarGurus may show similar vehicles if you broaden your search criteria.`,
+          suggestion: pageContent.suggestion,
+          searchUrl: searchUrl,
+          listings: []
+        });
+      }
+    }
+
+    // If skipDetails is true, return listings without visiting detail pages
+    if (skipDetails) {
+      await browser.close();
+      
+      return res.json({
+        success: true,
+        count: listings.length,
+        searchUrl: searchUrl,
+        distance: distance === 'nationwide' ? 'nationwide' : `${distance} miles`,
+        note: 'CarGurus automatically includes similar vehicles when exact matches are limited',
+        listings: listings
+      });
+    }
+
     // For each listing, get detailed info
     const detailedListings = [];
+    const maxDetails = Math.min(listings.length, 5); // Limit detail fetching
     
-    for (const listing of listings.slice(0, 5)) { // Limit to 5 for speed
+    for (let i = 0; i < maxDetails; i++) {
+      const listing = listings[i];
       if (listing.detailUrl) {
         try {
           await page.goto(listing.detailUrl, { 
@@ -166,7 +274,10 @@ app.post('/scrape', async (req, res) => {
     res.json({
       success: true,
       count: detailedListings.length,
+      totalFound: listings.length,
       searchUrl: searchUrl,
+      distance: distance === 'nationwide' ? 'nationwide' : `${distance} miles`,
+      note: 'CarGurus automatically includes similar vehicles when exact matches are limited',
       listings: detailedListings
     });
 
