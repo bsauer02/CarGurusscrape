@@ -1,8 +1,8 @@
 [phases.setup]
-nixPkgs = ["nodejs", "nodePackages.npm", "chromium"]
+nixPkgs = ["nodejs_18", "npm", "chromium"]
 
 [phases.install]
-cmds = ["npm install"]
+cmds = ["npm ci --omit=dev"]
 
 [start]
 cmd = "npm start"
