@@ -8,7 +8,19 @@ app.use(express.json());
 
 // Health check endpoint
 app.get('/', (req, res) => {
-  res.json({ status: 'CarGurus Scraper is running!' });
+  res.json({ 
+    status: 'CarGurus Scraper is running!',
+    environment: process.env.NODE_ENV || 'development',
+    port: process.env.PORT || 3000
+  });
+});
+
+// Test endpoint without Puppeteer
+app.get('/test', (req, res) => {
+  res.json({ 
+    message: 'Server is working!',
+    puppeteerPath: process.env.PUPPETEER_EXECUTABLE_PATH || 'Not set'
+  });
 });
 
 // Main scraping endpoint
@@ -25,7 +37,8 @@ app.post('/scrape', async (req, res) => {
   } = req.body;
 
   try {
-    const browser = await puppeteer.launch({
+    // Different config for production vs development
+    const puppeteerConfig = {
       headless: 'new',
       args: [
         '--no-sandbox',
@@ -37,7 +50,16 @@ app.post('/scrape', async (req, res) => {
         '--single-process',
         '--disable-extensions'
       ]
-    });
+    };
+
+    // Use nixpacks Chromium path if available
+    if (process.env.PUPPETEER_EXECUTABLE_PATH) {
+      puppeteerConfig.executablePath = process.env.PUPPETEER_EXECUTABLE_PATH;
+    }
+
+    console.log('Launching browser with config:', puppeteerConfig);
+    
+    const browser = await puppeteer.launch(puppeteerConfig);
 
     const page = await browser.newPage();
     
@@ -283,15 +305,21 @@ app.post('/scrape', async (req, res) => {
 
   } catch (error) {
     console.error('Scraping error:', error);
+    console.error('Full error details:', error.stack);
     res.status(500).json({ 
       success: false, 
       error: error.message,
+      details: 'Check Railway logs for more information',
       stack: process.env.NODE_ENV === 'development' ? error.stack : undefined
     });
   }
 });
 
 const PORT = process.env.PORT || 3000;
-app.listen(PORT, () => {
-  console.log(`CarGurus scraper running on port ${PORT}`);
+const HOST = '0.0.0.0'; // Important for Railway!
+
+app.listen(PORT, HOST, () => {
+  console.log(`CarGurus scraper running on ${HOST}:${PORT}`);
+  console.log(`Environment: ${process.env.NODE_ENV || 'development'}`);
+  console.log(`Puppeteer executable: ${process.env.PUPPETEER_EXECUTABLE_PATH || 'Using bundled Chromium'}`);
 });
